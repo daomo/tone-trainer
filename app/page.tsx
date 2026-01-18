@@ -9,8 +9,8 @@ const DEFAULT_PARAMS: F0Params = {
   targetSr: 16000,
 
   // Speech (tones) tends to look better with denser hop.
-  hopMs: 10,
-  windowMs: 40,
+  hopMs: 4,
+  windowMs: 100,
 
   fminHz: 70,
   fmaxHz: 380,
@@ -21,7 +21,14 @@ const DEFAULT_PARAMS: F0Params = {
   trimRmsRatio: 0.02,
   trimPadMs: 60,
 
-  maxJumpSemitone: 4,
+  // DP / Viterbi stabilization
+  dpEnabled: true,
+  dpTopK: 5,
+  dpLambda: 80,
+  dpUSwitch: 0.5,
+  dpUPenalty: 0.6,
+
+  maxJumpSemitone: 12,
   gapFillMs: 120,
   medWin: 7,
   smoothWin: 9,
@@ -335,6 +342,27 @@ export default function Page() {
           <Field label="rmsSilence" value={params.rmsSilence} step={0.001} min={0.001} max={0.05}
             onChange={(v) => setParams(p => ({ ...p, rmsSilence: v }))} />
 
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={params.dpEnabled}
+              onChange={(e) => setParams(p => ({ ...p, dpEnabled: e.target.checked }))}
+            />
+            <span>dpEnabled (候補+DPで安定化)</span>
+          </div>
+
+          <Field label="dpTopK" value={params.dpTopK} step={1} min={2} max={6}
+            onChange={(v) => setParams(p => ({ ...p, dpTopK: Math.round(v) }))} />
+
+          <Field label="dpLambda" value={params.dpLambda} step={10} min={0} max={500}
+            onChange={(v) => setParams(p => ({ ...p, dpLambda: v }))} />
+
+          <Field label="dpUSwitch" value={params.dpUSwitch} step={0.05} min={0} max={2}
+            onChange={(v) => setParams(p => ({ ...p, dpUSwitch: v }))} />
+
+          <Field label="dpUPenalty" value={params.dpUPenalty} step={0.05} min={0} max={2}
+            onChange={(v) => setParams(p => ({ ...p, dpUPenalty: v }))} />
 
           <Field label="trimRmsRatio" value={params.trimRmsRatio} step={0.005} min={0.005} max={0.08}
             onChange={(v) => setParams(p => ({ ...p, trimRmsRatio: v }))} />

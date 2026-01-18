@@ -11,6 +11,13 @@ export type F0Params = {
   trimRmsRatio: number;  // ratio of max RMS to detect silence (0.01-0.05)
   trimPadMs: number;     // keep a small padding around trimmed edges (20-120)
 
+  // DP / Viterbi stabilization (pYIN-like core)
+  dpEnabled: boolean;      // enable candidate + DP path selection
+  dpTopK: number;          // number of voiced candidates per frame (2-6)
+  dpLambda: number;        // smoothness strength for voiced->voiced (ΔlogF0^2)
+  dpUSwitch: number;       // penalty for switching voiced <-> unvoiced
+  dpUPenalty: number;      // per-frame penalty for choosing unvoiced (larger => prefer voiced)
+
   // Post-processing for stability (tone contour)
   maxJumpSemitone: number; // max allowed jump per frame (1-6)
   gapFillMs: number;       // fill short NaN gaps (50-250)
