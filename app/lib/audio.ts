@@ -2,6 +2,27 @@ export async function startRecording(
   onStop: (blob: Blob) => void,
   onError: (err: unknown) => void
 ) {
+  // Prefer MediaRecorder when available, but iOS Safari can be flaky.
+  // Fallback: capture PCM via WebAudio (ScriptProcessor) and build WAV for playback.
+  try {
+    if (supportsMediaRecorder()) {
+      return await startMediaRecorder(onStop, onError);
+    }
+    return await startPcmRecorder(onStop, onError);
+  } catch (e) {
+    onError(e);
+    throw e;
+  }
+}
+
+function supportsMediaRecorder() {
+  return typeof window !== "undefined" && typeof (window as any).MediaRecorder !== "undefined";
+}
+
+async function startMediaRecorder(
+  onStop: (blob: Blob) => void,
+  onError: (err: unknown) => void
+) {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
   const mimeType = pickMimeType();
@@ -26,7 +47,123 @@ export async function startRecording(
     },
     stream,
     recorder,
+    mode: "mediarecorder" as const,
   };
+}
+
+// iOS-friendly PCM recorder (ScriptProcessor fallback)
+// Note: ScriptProcessor is deprecated but still the most broadly supported fallback (incl. iOS).
+async function startPcmRecorder(
+  onStop: (blob: Blob) => void,
+  onError: (err: unknown) => void
+) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+  const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
+  // iOS often starts suspended until a user gesture.
+  await ac.resume().catch(() => {});
+
+  const source = ac.createMediaStreamSource(stream);
+
+  // Buffer size tradeoff: larger is lighter, smaller is lower latency.
+  const bufferSize = 4096;
+  const sp = ac.createScriptProcessor(bufferSize, 1, 1);
+
+  const chunks: Float32Array[] = [];
+  sp.onaudioprocess = (e) => {
+    try {
+      const input = e.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(input));
+    } catch (err) {
+      onError(err);
+    }
+  };
+
+  source.connect(sp);
+
+  // Some browsers require connecting to destination even if muted.
+  const gain = ac.createGain();
+  gain.gain.value = 0;
+  sp.connect(gain);
+  gain.connect(ac.destination);
+
+  let stopped = false;
+
+  async function stop() {
+    if (stopped) return;
+    stopped = true;
+    try {
+      sp.disconnect();
+      source.disconnect();
+      gain.disconnect();
+    } catch {}
+    cleanupStream(stream);
+    await ac.close().catch(() => {});
+
+    const pcm = concatFloat32(chunks);
+    const wavBlob = encodeWav16(pcm, ac.sampleRate);
+    onStop(wavBlob);
+  }
+
+  return {
+    stop,
+    stream,
+    recorder: null,
+    mode: "pcm" as const,
+  };
+}
+
+function concatFloat32(parts: Float32Array[]) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Float32Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+function encodeWav16(samples: Float32Array, sampleRate: number) {
+  // mono, 16-bit PCM WAV
+  const numChannels = 1;
+  const bytesPerSample = 2;
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = samples.length * bytesPerSample;
+
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true); // PCM header size
+  view.setUint16(20, 1, true);  // PCM format
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    let s = samples[i];
+    s = Math.max(-1, Math.min(1, s));
+    const v = s < 0 ? s * 0x8000 : s * 0x7fff;
+    view.setInt16(offset, v, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
 }
 
 function cleanupStream(stream: MediaStream) {

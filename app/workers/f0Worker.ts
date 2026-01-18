@@ -14,8 +14,8 @@ import type { WorkerRequest, WorkerResponse, F0Params, F0Result } from "../lib/t
   if (msg.type === "analyze") {
     try {
       const { pcm, sr, params } = msg;
-      (self as any).postMessage({ type: "progress", phase: "YIN" } satisfies WorkerResponse);
 
+      (self as any).postMessage({ type: "progress", phase: "YIN" } satisfies WorkerResponse);
       const res = analyzeF0(pcm, sr, params);
 
       (self as any).postMessage({ type: "result", result: res } satisfies WorkerResponse);
@@ -29,11 +29,10 @@ import type { WorkerRequest, WorkerResponse, F0Params, F0Result } from "../lib/t
 };
 
 function analyzeF0(pcm: Float32Array, sr: number, p: F0Params): F0Result {
-  const targetSr = sr; // already resampled on main thread
-  const hop = Math.max(1, Math.round(targetSr * (p.hopMs / 1000)));
-  const frameSize = nextPow2(Math.round(targetSr * (p.windowMs / 1000)));
+  const hop = Math.max(1, Math.round(sr * (p.hopMs / 1000)));
+  const frameSize = nextPow2(Math.round(sr * (p.windowMs / 1000)));
 
-  const f0 = yinTrack(pcm, targetSr, {
+  const f0 = yinTrack(pcm, sr, {
     frameSize,
     hop,
     fminHz: p.fminHz,
@@ -42,13 +41,27 @@ function analyzeF0(pcm: Float32Array, sr: number, p: F0Params): F0Result {
     rmsSilence: p.rmsSilence,
   });
 
-  const f0Log = f0.map(v => (Number.isFinite(v) && v > 0) ? Math.log(v) : NaN);
-  const smoothed = medianFilterNaN(f0Log, p.medWin);
+  const f0LogRaw = f0.map(v => (Number.isFinite(v) && v > 0) ? Math.log(v) : NaN);
 
-  const duration = pcm.length / targetSr;
-  const times = smoothed.map((_, i) => (i * hop) / targetSr);
+  (self as any).postMessage({ type: "progress", phase: "postprocess" } satisfies WorkerResponse);
 
-  return { sr: targetSr, duration, times, f0Log: smoothed };
+  // 1) median filter
+  let f0Log = medianFilterNaN(f0LogRaw, p.medWin);
+
+  // 2) jump limiter (reject big jumps as NaN)
+  f0Log = jumpReject(f0Log, p.maxJumpSemitone);
+
+  // 3) fill short gaps
+  const gapMaxFrames = Math.max(0, Math.round((p.gapFillMs / 1000) * sr / hop));
+  if (gapMaxFrames > 0) f0Log = fillShortGapsLinear(f0Log, gapMaxFrames);
+
+  // 4) moving average smooth
+  f0Log = movingAverageNaN(f0Log, p.smoothWin);
+
+  const duration = pcm.length / sr;
+  const times = f0Log.map((_, i) => (i * hop) / sr);
+
+  return { sr, duration, times, f0Log };
 }
 
 function yinTrack(
@@ -89,6 +102,7 @@ function yinTrack(
       continue;
     }
 
+    // Difference function
     d[0] = 0;
     for (let tau = 1; tau <= tauMax; tau++) {
       let sum = 0;
@@ -100,6 +114,7 @@ function yinTrack(
       d[tau] = sum;
     }
 
+    // CMND
     cmnd[0] = 1;
     let runningSum = 0;
     for (let tau = 1; tau <= tauMax; tau++) {
@@ -107,7 +122,7 @@ function yinTrack(
       cmnd[tau] = (d[tau] * tau) / (runningSum + 1e-12);
     }
 
-    // first dip below threshold
+    // First dip below threshold
     let tauEstimate = -1;
     for (let tau = tauMin; tau <= tauMax; tau++) {
       if (cmnd[tau] < thresh) {
@@ -170,6 +185,72 @@ function medianFilterNaN(x: number[], win: number) {
       buf.sort((a, b) => a - b);
       out[i] = buf[Math.floor(buf.length / 2)];
     }
+  }
+  return out;
+}
+
+function semitoneDiff(aLog: number, bLog: number) {
+  return (12 * (bLog - aLog)) / Math.LN2;
+}
+
+function jumpReject(x: number[], maxJumpSemitone: number) {
+  if (!Number.isFinite(maxJumpSemitone) || maxJumpSemitone <= 0) return x.slice();
+  const out = x.slice();
+  let prevIdx = -1;
+  for (let i = 0; i < out.length; i++) {
+    if (!Number.isFinite(out[i])) continue;
+    if (prevIdx >= 0) {
+      const dSemi = Math.abs(semitoneDiff(out[prevIdx], out[i]));
+      if (dSemi > maxJumpSemitone) {
+        out[i] = NaN;
+        continue;
+      }
+    }
+    prevIdx = i;
+  }
+  return out;
+}
+
+function fillShortGapsLinear(x: number[], maxGap: number) {
+  const out = x.slice();
+  const n = out.length;
+  let i = 0;
+  while (i < n) {
+    if (Number.isFinite(out[i])) { i++; continue; }
+    const start = i;
+    while (i < n && !Number.isFinite(out[i])) i++;
+    const end = i;
+    const gapLen = end - start;
+
+    const left = start - 1;
+    const right = end;
+    if (gapLen <= maxGap && left >= 0 && right < n && Number.isFinite(out[left]) && Number.isFinite(out[right])) {
+      const a = out[left];
+      const b = out[right];
+      for (let k = 1; k <= gapLen; k++) {
+        out[left + k] = a + (b - a) * (k / (gapLen + 1));
+      }
+    }
+  }
+  return out;
+}
+
+function movingAverageNaN(x: number[], win: number) {
+  if (win <= 1) return x.slice();
+  if (win % 2 === 0) win += 1;
+  const r = Math.floor(win / 2);
+  const out = new Array<number>(x.length);
+
+  for (let i = 0; i < x.length; i++) {
+    let sum = 0;
+    let cnt = 0;
+    for (let k = -r; k <= r; k++) {
+      const j = i + k;
+      if (j < 0 || j >= x.length) continue;
+      const v = x[j];
+      if (Number.isFinite(v)) { sum += v; cnt++; }
+    }
+    out[i] = cnt > 0 ? sum / cnt : NaN;
   }
   return out;
 }

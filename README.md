@@ -1,28 +1,7 @@
-# f0-yin-nextjs
+# tone-trainer
 
 ローカル完結の「録音 → F0抽出(YIN) → Canvas描画 → 再生同期(縦線)」デモです。  
 重い処理（YIN＋平滑化）は WebWorker に隔離しています。
-
-## 起動方法（初心者向け）
-
-### 1) Node.js をインストール
-- Node.js 18 以上（できれば 20）を入れてください。
-
-### 2) 依存関係をインストール
-このフォルダでターミナルを開いて：
-
-```bash
-npm install
-```
-
-### 3) 開発サーバー起動
-```bash
-npm run dev
-```
-
-起動後、ブラウザで `http://localhost:3000` を開きます。
-
-> マイクは `localhost` なら許可が出ます（HTTPS扱い）。
 
 ## 使い方
 - 「録音開始」→「停止」すると、**自動で解析→描画**します。
@@ -34,26 +13,23 @@ npm run dev
 - Worker が動かない / import.meta.url 周りでエラー：  
   `next dev --turbo` を使っている場合は、いったん通常の `npm run dev` で試してください。
 
-## GitHub Pages への公開（export + CI/CD）
+## iOS / スマホで録音できないとき
+- iOS Safari は `MediaRecorder` が不安定な場合があります。
+- このプロジェクトは `MediaRecorder` が使えない場合、**PCM録音（ScriptProcessor）に自動フォールバック**します。
+- それでもダメな場合は「アプリ内ブラウザ（LINE等）」を避けて Safari で開いてください。
 
-このプロジェクトは **Next.js 静的書き出し（output: "export"）** で、GitHub Pages にそのまま載せられます。
+## パラメータの意味（Debug Params）
+- targetSr: 解析用サンプリング周波数（16kHz推奨）
+- hopMs: 何msごとにF0を出すか。小さいほど滑らか（負荷↑）
+- windowMs: 窓長。短いほど追従（ノイズ↑）、長いほど安定（遅れ/ぼやけ↑）
+- fminHz/fmaxHz: 探索するF0範囲（狭いほど安定＆速い）
+- yinThreshold: 有声音判定の厳しさ。小さいほど「確信がある時だけF0」
+- rmsSilence: フレーム単位の無声ゲート（小さいほど拾う）
 
-### 1) リポジトリ作成＆push
-- GitHub にリポジトリ（例: `f0-yin-nextjs`）を作り、`main` ブランチに push。
+- trimRmsRatio: 録音全体の先頭/末尾の無音を切るしきい値（最大RMSに対する割合）
+- trimPadMs: 切り詰め後に残す余白（ms）
 
-### 2) Pages の設定
-GitHub のリポジトリ画面 → **Settings → Pages**
-- **Source** を **GitHub Actions** にする
-
-### 3) 自動デプロイ
-`main` に push すると、GitHub Actions が走って `out/` を Pages にデプロイします。
-- ワークフロー: `.github/workflows/pages.yml`
-
-### URL
-Project Pages の場合:
-- `https://<ユーザー名>.github.io/<リポジトリ名>/`
-
-### 補足（basePathについて）
-- GitHub Pages（Project Pages）はサブパス配下（`/<repo>/`）になるため、
-  `next.config.js` で **本番時だけ** `basePath`/`assetPrefix` を自動設定しています。
-- Actions 内で `NEXT_PUBLIC_REPO_NAME` をリポジトリ名に自動設定しています。
+- maxJumpSemitone: 1フレームで許す最大ジャンプ（半音）。小さいほど滑らか（外れはNaN化）
+- gapFillMs: 短いNaN穴を線形補間する最大長（ms）
+- medWin: 中央値フィルタ窓（外れ値に強い）
+- smoothWin: 移動平均窓（階段状の見た目改善に効く）

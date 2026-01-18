@@ -7,13 +7,24 @@ import { drawBase, makeDrawState, redrawWithCursor } from "./lib/draw";
 
 const DEFAULT_PARAMS: F0Params = {
   targetSr: 16000,
-  hopMs: 20,
+
+  // Speech (tones) tends to look better with denser hop.
+  hopMs: 10,
   windowMs: 40,
-  fminHz: 80,
-  fmaxHz: 350,
+
+  fminHz: 70,
+  fmaxHz: 380,
+
   yinThreshold: 0.12,
   rmsSilence: 0.008,
+
+  trimRmsRatio: 0.02,
+  trimPadMs: 60,
+
+  maxJumpSemitone: 4,
+  gapFillMs: 120,
   medWin: 7,
+  smoothWin: 9,
 };
 
 export default function Page() {
@@ -125,13 +136,7 @@ export default function Page() {
           setRecording(false);
           setStatus("recorded. decoding…");
 
-          const url = URL.createObjectURL(b);
-          setBlobUrl((prev) => {
-            if (prev) URL.revokeObjectURL(prev);
-            return url;
-          });
-
-          // auto analyze immediately
+          // auto analyze immediately (this will also set playback audio)
           await analyzeBlob(b);
         },
         (err) => {
@@ -165,7 +170,19 @@ export default function Page() {
       setStatus("resampling…");
 
       const target = params.targetSr;
-      const pcm = await resampleMonoPCM(mono, sr, target);
+      let pcm = await resampleMonoPCM(mono, sr, target);
+
+      // Trim leading/trailing silence (whole recording)
+      pcm = trimSilence(pcm, target, params.trimRmsRatio, params.trimPadMs);
+
+      // Make playback audio match analysis (trimmed WAV)
+      const wavBlob = encodeWav16(pcm, target);
+      const url = URL.createObjectURL(wavBlob);
+      setBlobUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return url;
+      });
+
 
       // stash for re-analyze
       lastPcmRef.current = pcm;
@@ -176,9 +193,11 @@ export default function Page() {
       if (!w) throw new Error("worker not ready");
 
       // transfer the buffer for speed
+      // send a separate buffer to worker (transfer only this one)
+      const pcmSend = pcm.slice();
       w.postMessage(
-        { type: "analyze", pcm, sr: target, params } as any,
-        [pcm.buffer]
+        { type: "analyze", pcm: pcmSend, sr: target, params } as any,
+        [pcmSend.buffer]
       );
     } catch (e: any) {
       console.error(e);
@@ -197,8 +216,12 @@ export default function Page() {
     setBusy(true);
     setStatus("re-analyzing…");
 
-    // If last buffer was transferred, make a fresh copy for worker transfer
-    const pcmCopy = new Float32Array(pcm);
+    // If the buffer is detached (can happen if you transferred it), ask user to re-record
+    if (pcm.buffer.byteLength === 0) {
+      setBusy(false);
+      setStatus("pcm buffer detached. もう一度録音してください。");
+      return;
+    }
 
     const w = workerRef.current;
     if (!w) {
@@ -207,9 +230,10 @@ export default function Page() {
       return;
     }
 
+    const pcmSend = pcm.slice();
     w.postMessage(
-      { type: "analyze", pcm: pcmCopy, sr, params } as any,
-      [pcmCopy.buffer]
+      { type: "analyze", pcm: pcmSend, sr, params } as any,
+      [pcmSend.buffer]
     );
   }
 
@@ -267,6 +291,7 @@ export default function Page() {
         )}
       </div>
 
+      {blobUrl ? (
       <audio
         ref={audioRef}
         controls
@@ -275,8 +300,8 @@ export default function Page() {
         onPlay={() => startRaf()}
         onPause={() => onPause()}
       />
-
-      <p className="small" style={{ marginTop: 10 }}>
+    ) : null}
+<p className="small" style={{ marginTop: 10 }}>
         録音停止後に自動で解析します（16kHz→YIN→中央値平滑化）。描画はCanvas、縦線は再生位置に同期。
       </p>
 
@@ -310,8 +335,23 @@ export default function Page() {
           <Field label="rmsSilence" value={params.rmsSilence} step={0.001} min={0.001} max={0.05}
             onChange={(v) => setParams(p => ({ ...p, rmsSilence: v }))} />
 
+
+          <Field label="trimRmsRatio" value={params.trimRmsRatio} step={0.005} min={0.005} max={0.08}
+            onChange={(v) => setParams(p => ({ ...p, trimRmsRatio: v }))} />
+
+          <Field label="trimPadMs" value={params.trimPadMs} step={10} min={0} max={200}
+            onChange={(v) => setParams(p => ({ ...p, trimPadMs: v }))} />
+
+          <Field label="maxJumpSemitone" value={params.maxJumpSemitone} step={1} min={0} max={12}
+            onChange={(v) => setParams(p => ({ ...p, maxJumpSemitone: v }))} />
+
+          <Field label="gapFillMs" value={params.gapFillMs} step={10} min={0} max={400}
+            onChange={(v) => setParams(p => ({ ...p, gapFillMs: v }))} />
           <Field label="medWin (odd)" value={params.medWin} step={2} min={1} max={21}
             onChange={(v) => setParams(p => ({ ...p, medWin: v % 2 === 0 ? v + 1 : v }))} />
+
+          <Field label="smoothWin (odd)" value={params.smoothWin} step={2} min={1} max={41}
+            onChange={(v) => setParams(p => ({ ...p, smoothWin: v % 2 === 0 ? v + 1 : v }))} />
 
           <div className="debugActions">
             <button onClick={reAnalyze} disabled={busy}>
@@ -326,7 +366,7 @@ export default function Page() {
           </div>
 
           <div className="small" style={{ marginTop: 10 }}>
-            Tip: 倍音ジャンプが気になるなら <b>medWin</b> を上げる / <b>yinThreshold</b> を少し下げる。
+            Tip: 声調の階段っぽさは <b>hopMs=10</b> / <b>smoothWin</b>↑ / <b>maxJumpSemitone</b>↓ が効きます。無音が残るなら <b>trimRmsRatio</b>↑。
           </div>
         </div>
       ) : (
@@ -368,4 +408,86 @@ function Field(props: {
       />
     </div>
   );
+}
+
+
+function trimSilence(pcm: Float32Array, sr: number, rmsRatio: number, padMs: number) {
+  if (pcm.length === 0) return pcm;
+
+  const win = Math.max(64, Math.round(sr * 0.02)); // 20ms
+  const hop = Math.max(32, Math.round(win / 2));
+
+  const rms: number[] = [];
+  let maxR = 0;
+  for (let start = 0; start + win <= pcm.length; start += hop) {
+    let s = 0;
+    for (let i = 0; i < win; i++) {
+      const v = pcm[start + i];
+      s += v * v;
+    }
+    const r = Math.sqrt(s / win);
+    rms.push(r);
+    if (r > maxR) maxR = r;
+  }
+  if (maxR <= 1e-9) return pcm;
+
+  const thr = Math.max(1e-6, maxR * rmsRatio);
+
+  let first = -1, last = -1;
+  for (let i = 0; i < rms.length; i++) {
+    if (rms[i] >= thr) { first = i; break; }
+  }
+  for (let i = rms.length - 1; i >= 0; i--) {
+    if (rms[i] >= thr) { last = i; break; }
+  }
+  if (first < 0 || last < 0 || last < first) return pcm;
+
+  const pad = Math.round((padMs / 1000) * sr);
+
+  const startSample = Math.max(0, first * hop - pad);
+  const endSample = Math.min(pcm.length, (last * hop + win) + pad);
+
+  if (endSample - startSample < Math.round(0.2 * sr)) return pcm;
+  return pcm.slice(startSample, endSample);
+}
+
+
+function encodeWav16(samples: Float32Array, sampleRate: number) {
+  // mono, 16-bit PCM WAV
+  const numChannels = 1;
+  const bytesPerSample = 2;
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = samples.length * bytesPerSample;
+
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    const v = s < 0 ? s * 0x8000 : s * 0x7fff;
+    view.setInt16(offset, v, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
 }
