@@ -1,38 +1,28 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { F0Params, F0Result, WorkerResponse } from "./lib/types";
+import type {
+  F0Params,
+  F0Result,
+  WorkerResponse,
+  ReferenceIndex,
+  ReferenceAudio,
+  ReferenceItem,
+  ReferenceFeature,
+  ComparisonResult,
+} from "./lib/types";
 import { startRecording, decodeToMonoPCM, resampleMonoPCM } from "./lib/audio";
-import { drawBase, makeDrawState, redrawWithCursor } from "./lib/draw";
-
-const DEFAULT_PARAMS: F0Params = {
-  targetSr: 16000,
-
-  // Speech (tones) tends to look better with denser hop.
-  hopMs: 4,
-  windowMs: 100,
-
-  fminHz: 70,
-  fmaxHz: 380,
-
-  yinThreshold: 0.12,
-  rmsSilence: 0.008,
-
-  trimRmsRatio: 0.02,
-  trimPadMs: 60,
-
-  // DP / Viterbi stabilization
-  dpEnabled: true,
-  dpTopK: 5,
-  dpLambda: 80,
-  dpUSwitch: 0.5,
-  dpUPenalty: 0.6,
-
-  maxJumpSemitone: 12,
-  gapFillMs: 120,
-  medWin: 7,
-  smoothWin: 9,
-};
+import { drawBase, drawReferenceOnly, makeDrawState, redrawCursorOnly, redrawWithCursor } from "./lib/draw";
+import AudioControls from "./components/AudioControls";
+import PitchCanvas from "./components/PitchCanvas";
+import DebugPanel from "./components/DebugPanel";
+import PlaybackPlayer from "./components/PlaybackPlayer";
+import ReferenceList from "./components/ReferenceList";
+import { DEFAULT_PARAMS } from "./features/analysis/constants";
+import { trimSilence } from "./features/analysis/trim";
+import { encodeWav16 } from "./features/analysis/wav";
+import { dtwBandFeatures } from "./features/analysis/dtw";
+import { computeMfcc } from "./features/analysis/mfcc";
 
 export default function Page() {
   const [params, setParams] = useState<F0Params>(DEFAULT_PARAMS);
@@ -41,6 +31,11 @@ export default function Page() {
   const isProd = process.env.NODE_ENV === "production";
   const [debugAllowed, setDebugAllowed] = useState(!isProd);
   const [debugOpen, setDebugOpen] = useState(!isProd);
+  const [playing, setPlaying] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [voiceVariant, setVoiceVariant] = useState<"A" | "B">("A");
+  const [referenceOpen, setReferenceOpen] = useState(false);
+  const [referencePlaying, setReferencePlaying] = useState(false);
 
   const [blobUrl, setBlobUrl] = useState<string>("");
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -56,9 +51,21 @@ export default function Page() {
 
   const analysisRef = useRef<F0Result | null>(null);
   const rafRef = useRef<number | null>(null);
+  const [analysisVersion, setAnalysisVersion] = useState(0);
 
   const recCtlRef = useRef<{ stop: () => void } | null>(null);
   const [recording, setRecording] = useState(false);
+  const [referenceIndex, setReferenceIndex] = useState<ReferenceIndex | null>(null);
+  const [referenceError, setReferenceError] = useState<string>("");
+  const [selectedReference, setSelectedReference] = useState<ReferenceItem | null>(null);
+  const [selectedReferenceAudio, setSelectedReferenceAudio] = useState<ReferenceAudio | null>(null);
+  const [referenceFeature, setReferenceFeature] = useState<ReferenceFeature | null>(null);
+  const [referenceFeatureError, setReferenceFeatureError] = useState<string>("");
+  const [comparison, setComparison] = useState<ComparisonResult | null>(null);
+  const [alignmentError, setAlignmentError] = useState("");
+  const [alignedReference, setAlignedReference] = useState<F0Result | null>(null);
+  const referenceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const refRafRef = useRef<number | null>(null);
 
   useEffect(() => {
     const cv = cvRef.current!;
@@ -78,13 +85,12 @@ export default function Page() {
       } else if (msg.type === "result") {
         analysisRef.current = msg.result;
         setBusy(false);
+        setAnalysisVersion((v) => v + 1);
         setStatus(`done: ${msg.result.duration.toFixed(2)}s, frames=${msg.result.times.length}`);
 
         const ctx2 = ctxRef.current;
         const cv2 = cvRef.current;
-        if (ctx2 && cv2) {
-          drawBase(ctx2, cv2, msg.result, params, drawState);
-        }
+        if (ctx2 && cv2) renderBase();
       } else if (msg.type === "error") {
         setBusy(false);
         setStatus(`error: ${msg.message}`);
@@ -98,6 +104,117 @@ export default function Page() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    let alive = true;
+    fetch("/reference/index.json")
+      .then((res) => {
+        if (!res.ok) throw new Error(`index fetch failed (${res.status})`);
+        return res.json();
+      })
+      .then((data: ReferenceIndex) => {
+        if (!alive) return;
+        setReferenceIndex(data);
+      })
+      .catch((err) => {
+        if (!alive) return;
+        console.error(err);
+        setReferenceError("お手本一覧の読み込みに失敗しました。");
+      });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedReference) return;
+    const nextAudio = pickReferenceAudio(selectedReference, voiceVariant);
+    setSelectedReferenceAudio(nextAudio);
+  }, [selectedReference, voiceVariant]);
+
+  useEffect(() => {
+    if (!selectedReferenceAudio?.featurePath) {
+      setReferenceFeature(null);
+      setReferenceFeatureError("");
+      return;
+    }
+    let alive = true;
+    const url = selectedReferenceAudio.featurePath.startsWith("/")
+      ? selectedReferenceAudio.featurePath
+      : `/${selectedReferenceAudio.featurePath}`;
+    fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error(`feature fetch failed (${res.status})`);
+        return res.json();
+      })
+      .then((data: ReferenceFeature) => {
+        if (!alive) return;
+        setReferenceFeature(data);
+        setReferenceFeatureError("");
+      })
+      .catch((err) => {
+        if (!alive) return;
+        console.error(err);
+        setReferenceFeature(null);
+        setReferenceFeatureError("お手本特徴量の読み込みに失敗しました。");
+      });
+    return () => { alive = false; };
+  }, [selectedReferenceAudio]);
+
+  useEffect(() => {
+    renderBase();
+  }, [referenceFeature]);
+
+  useEffect(() => {
+    if (!selectedReference) return;
+    clearRecording();
+  }, [selectedReference]);
+
+  useEffect(() => {
+    const user = analysisRef.current;
+    if (!user) {
+      setComparison(null);
+      setAlignmentError("");
+      setAlignedReference(null);
+      renderBase({ user: null, reference: referenceFeature ?? null });
+      return;
+    }
+    if (!referenceFeature) {
+      setComparison(null);
+      setAlignmentError("");
+      setAlignedReference(null);
+      renderBase({ user, reference: null });
+      return;
+    }
+    const refFeatures = referenceFeature.features;
+    const userFeatures = buildUserMfccFeatures(
+      lastPcmRef.current,
+      lastSrRef.current,
+      referenceFeature
+    );
+    if (!userFeatures) {
+      setAlignmentError("解析に失敗しました。");
+      setComparison(null);
+      setAlignedReference(null);
+      renderBase({ user, reference: referenceFeature });
+      return;
+    }
+    const { path } = dtwBandFeatures(refFeatures, userFeatures);
+    if (path.length === 0) {
+      setAlignmentError("解析に失敗しました。");
+      setComparison(null);
+      setAlignedReference(null);
+      renderBase({ user, reference: referenceFeature });
+      return;
+    }
+    setAlignmentError("");
+    setComparison(null);
+    const aligned = buildAlignedReference(user, referenceFeature, path);
+    setAlignedReference(aligned);
+    renderBase({
+      user,
+      reference: referenceFeature,
+      alignedReference: aligned,
+    });
+  }, [referenceFeature, analysisVersion]);
 
   useEffect(() => {
     if (!isProd) return;
@@ -114,6 +231,7 @@ export default function Page() {
 
     const onEnded = () => {
       stopRaf();
+      setPlaying(false);
       const a = analysisRef.current;
       const ctx = ctxRef.current;
       const cv = cvRef.current;
@@ -124,6 +242,74 @@ export default function Page() {
     return () => audio.removeEventListener("ended", onEnded);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.playbackRate = playbackRate;
+    audio.defaultPlaybackRate = playbackRate;
+  }, [playbackRate, blobUrl]);
+
+  function stopRefRaf() {
+    if (refRafRef.current != null) cancelAnimationFrame(refRafRef.current);
+    refRafRef.current = null;
+  }
+
+  function startRefRaf(refAudio: HTMLAudioElement) {
+    stopRefRaf();
+    const tick = () => {
+      const ctx = ctxRef.current;
+      const cv = cvRef.current;
+      if (ctx && cv) {
+        redrawCursorOnly(ctx, cv, drawState, refAudio.currentTime);
+      }
+      refRafRef.current = requestAnimationFrame(tick);
+    };
+    refRafRef.current = requestAnimationFrame(tick);
+  }
+
+  function clearRecording() {
+    analysisRef.current = null;
+    setAlignedReference(null);
+    setAlignmentError("");
+    setComparison(null);
+    setBlobUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return "";
+    });
+    stopRaf();
+    setPlaying(false);
+    renderBase({ user: null, reference: referenceFeature ?? null });
+  }
+
+  function renderBase(opts?: {
+    user?: F0Result | null;
+    reference?: ReferenceFeature | null;
+    alignedReference?: F0Result | null;
+  }) {
+    const ctx = ctxRef.current;
+    const cv = cvRef.current;
+    if (!ctx || !cv) return;
+    const user = opts?.user ?? analysisRef.current;
+    const reference = opts?.reference ?? referenceFeature;
+    const aligned = opts?.alignedReference ?? alignedReference;
+
+    if (user) {
+      const ref = aligned
+        ? { times: aligned.times, f0Log: aligned.f0Log, duration: aligned.duration }
+        : undefined;
+      drawBase(ctx, cv, user, params, drawState, ref);
+      return;
+    }
+
+    if (reference) {
+      drawReferenceOnly(ctx, cv, params, drawState, {
+        times: reference.times,
+        f0Log: reference.f0Log,
+        duration: reference.duration,
+      });
+    }
+  }
 
   function stopRaf() {
     if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
@@ -146,6 +332,10 @@ export default function Page() {
   }
 
   async function handleRecord() {
+    if (playing || referencePlaying) {
+      setStatus("再生中は録音できません");
+      return;
+    }
     setStatus("requesting mic…");
     try {
       setRecording(true);
@@ -256,279 +446,291 @@ export default function Page() {
   }
 
   function onPlay() {
+    if (recording) {
+      setStatus("録音中は再生できません");
+      return;
+    }
+    if (referenceAudioRef.current) {
+      referenceAudioRef.current.pause();
+      setReferencePlaying(false);
+      stopRefRaf();
+    }
     const audio = audioRef.current;
     if (!audio) return;
+    audio.playbackRate = playbackRate;
     audio.play();
-    startRaf();
   }
 
   function onPause() {
     const audio = audioRef.current;
     if (!audio) return;
     audio.pause();
-    stopRaf();
-
-    const a = analysisRef.current;
-    const ctx = ctxRef.current;
-    const cv = cvRef.current;
-    if (a && ctx && cv) redrawWithCursor(ctx, cv, a, params, drawState, audio.currentTime);
   }
 
   return (
     <div className="container">
-      <h2 style={{ margin: "10px 0 6px" }}>F0可視化（YIN + WebWorker）</h2>
+      <h2 style={{ margin: "10px 0 6px" }}>Tone Trainer</h2>
 
-      <div className="row">
-        <button onClick={handleRecord} disabled={busy || recording}>
-          録音開始
-        </button>
-        <button onClick={handleStop} disabled={!recording}>
-          停止
-        </button>
-
-        <button onClick={onPlay} disabled={busy || !blobUrl}>
-          再生
-        </button>
-        <button onClick={onPause} disabled={!blobUrl}>
-          一時停止
-        </button>
-
-        <span className="badge">{recording ? "REC" : "IDLE"}</span>
-        <span className="small">{status}</span>
-      </div>
-
-      <div className="canvasWrap">
-        <canvas ref={cvRef} width={980} height={280} />
-        {busy && (
-          <div className="overlay" aria-label="analyzing">
-            <div style={{ display: "grid", placeItems: "center", gap: 10 }}>
-              <div className="spinner" />
-              <div className="small">解析中…</div>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {blobUrl ? (
-      <audio
-        ref={audioRef}
-        controls
-        src={blobUrl}
-        style={{ width: "100%", marginTop: 10 }}
-        onPlay={() => startRaf()}
-        onPause={() => onPause()}
+      <AudioControls
+        busy={busy}
+        recording={recording}
+        playing={playing}
+        blobUrl={blobUrl}
+        status={status}
+        playbackRate={playbackRate}
+        onRecord={handleRecord}
+        onStop={handleStop}
+        onPlay={onPlay}
+        onPause={onPause}
+        onToggleRate={() => setPlaybackRate((prev) => (prev === 0.5 ? 1 : 0.5))}
+        onClearRecording={clearRecording}
       />
-    ) : null}
-<p className="small" style={{ marginTop: 10 }}>
-        録音停止後に自動で解析します（16kHz→YIN→中央値平滑化）。描画はCanvas、縦線は再生位置に同期。
+
+      <PitchCanvas canvasRef={cvRef} busy={busy} />
+
+      {comparison && (
+        <div className="resultPanel">
+          <div className="resultRow">
+            <span>相関</span>
+            <b>{comparison.corr.toFixed(2)}</b>
+          </div>
+          <div className="resultRow">
+            <span>RMSE</span>
+            <b>{comparison.rmse.toFixed(2)}</b>
+          </div>
+          <div className="resultRow">
+            <span>上昇/下降一致率</span>
+            <b>{(comparison.slopeMatch * 100).toFixed(0)}%</b>
+          </div>
+          <div className="resultRow">
+            <span>ピーク差</span>
+            <b>{comparison.peakShiftMs.toFixed(0)}ms</b>
+          </div>
+        </div>
+      )}
+      {alignmentError && (
+        <div className="resultPanel">
+          <div className="resultRow">
+            <span>{alignmentError}</span>
+          </div>
+        </div>
+      )}
+
+      <PlaybackPlayer
+        audioRef={audioRef}
+        blobUrl={blobUrl}
+        onPlay={() => {
+          if (recording) {
+            audioRef.current?.pause();
+            setStatus("録音中は再生できません");
+            return;
+          }
+          setPlaying(true);
+          startRaf();
+        }}
+        onPause={() => {
+          setPlaying(false);
+          stopRaf();
+          const a = analysisRef.current;
+          const ctx = ctxRef.current;
+          const cv = cvRef.current;
+          const audio = audioRef.current;
+          if (a && ctx && cv && audio) redrawWithCursor(ctx, cv, a, params, drawState, audio.currentTime);
+        }}
+      />
+
+      <p className="small" style={{ marginTop: 10 }}>
+        録音停止後に自動で解析します。
       </p>
 
-      {debugAllowed && (
-        debugOpen ? (
-          <div className="debugPanel">
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <h3>Debug Params</h3>
-              <button onClick={() => setDebugOpen(false)} style={{ padding: "6px 10px" }}>
-                閉じる
-              </button>
-            </div>
-
-            <Field label="targetSr" value={params.targetSr} step={1000} min={8000} max={48000}
-              onChange={(v) => setParams(p => ({ ...p, targetSr: v }))} />
-
-            <Field label="hopMs" value={params.hopMs} step={1} min={8} max={40}
-              onChange={(v) => setParams(p => ({ ...p, hopMs: v }))} />
-
-            <Field label="windowMs" value={params.windowMs} step={1} min={20} max={80}
-              onChange={(v) => setParams(p => ({ ...p, windowMs: v }))} />
-
-            <Field label="fminHz" value={params.fminHz} step={1} min={40} max={200}
-              onChange={(v) => setParams(p => ({ ...p, fminHz: v }))} />
-
-            <Field label="fmaxHz" value={params.fmaxHz} step={1} min={200} max={800}
-              onChange={(v) => setParams(p => ({ ...p, fmaxHz: v }))} />
-
-            <Field label="yinThreshold" value={params.yinThreshold} step={0.01} min={0.05} max={0.30}
-              onChange={(v) => setParams(p => ({ ...p, yinThreshold: v }))} />
-
-            <Field label="rmsSilence" value={params.rmsSilence} step={0.001} min={0.001} max={0.05}
-              onChange={(v) => setParams(p => ({ ...p, rmsSilence: v }))} />
-
-
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-              <input
-                type="checkbox"
-                checked={params.dpEnabled}
-                onChange={(e) => setParams(p => ({ ...p, dpEnabled: e.target.checked }))}
-              />
-              <span>dpEnabled (候補+DPで安定化)</span>
-            </div>
-
-            <Field label="dpTopK" value={params.dpTopK} step={1} min={2} max={6}
-              onChange={(v) => setParams(p => ({ ...p, dpTopK: Math.round(v) }))} />
-
-            <Field label="dpLambda" value={params.dpLambda} step={10} min={0} max={500}
-              onChange={(v) => setParams(p => ({ ...p, dpLambda: v }))} />
-
-            <Field label="dpUSwitch" value={params.dpUSwitch} step={0.05} min={0} max={2}
-              onChange={(v) => setParams(p => ({ ...p, dpUSwitch: v }))} />
-
-            <Field label="dpUPenalty" value={params.dpUPenalty} step={0.05} min={0} max={2}
-              onChange={(v) => setParams(p => ({ ...p, dpUPenalty: v }))} />
-
-            <Field label="trimRmsRatio" value={params.trimRmsRatio} step={0.005} min={0.005} max={0.08}
-              onChange={(v) => setParams(p => ({ ...p, trimRmsRatio: v }))} />
-
-            <Field label="trimPadMs" value={params.trimPadMs} step={10} min={0} max={200}
-              onChange={(v) => setParams(p => ({ ...p, trimPadMs: v }))} />
-
-            <Field label="maxJumpSemitone" value={params.maxJumpSemitone} step={1} min={0} max={12}
-              onChange={(v) => setParams(p => ({ ...p, maxJumpSemitone: v }))} />
-
-            <Field label="gapFillMs" value={params.gapFillMs} step={10} min={0} max={400}
-              onChange={(v) => setParams(p => ({ ...p, gapFillMs: v }))} />
-            <Field label="medWin (odd)" value={params.medWin} step={2} min={1} max={21}
-              onChange={(v) => setParams(p => ({ ...p, medWin: v % 2 === 0 ? v + 1 : v }))} />
-
-            <Field label="smoothWin (odd)" value={params.smoothWin} step={2} min={1} max={41}
-              onChange={(v) => setParams(p => ({ ...p, smoothWin: v % 2 === 0 ? v + 1 : v }))} />
-
-            <div className="debugActions">
-              <button onClick={reAnalyze} disabled={busy}>
-                再解析
-              </button>
-              <button
-                onClick={() => setParams(DEFAULT_PARAMS)}
-                disabled={busy}
-              >
-                デフォルトへ
-              </button>
-            </div>
-
-            <div className="small" style={{ marginTop: 10 }}>
-              Tip: 声調の階段っぽさは <b>hopMs=10</b> / <b>smoothWin</b>↑ / <b>maxJumpSemitone</b>↓ が効きます。無音が残るなら <b>trimRmsRatio</b>↑。
-            </div>
+      <div className="referenceSummary">
+        <div className="referenceSummaryText">
+          <div className="small">お手本</div>
+          <div>
+            {selectedReference ? selectedReference.text : "未選択"}
           </div>
-        ) : (
-          <div className="debugPanel" style={{ width: 180 }}>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <h3>Debug</h3>
-              <button onClick={() => setDebugOpen(true)} style={{ padding: "6px 10px" }}>
-                開く
-              </button>
+          {selectedReference && (
+            <div className="small">
+              {selectedReference.pinyin} / 音声{voiceVariant}
             </div>
-            <div className="small">パラメータ調整を表示します</div>
+          )}
+        </div>
+        <div className="referenceSummaryActions">
+          <button
+            onClick={() => {
+              if (!selectedReferenceAudio) {
+                setStatus("お手本を選んでください");
+                return;
+              }
+              if (!referenceFeature) {
+                setStatus("お手本特徴量を読み込み中です");
+                return;
+              }
+              if (recording) {
+                setStatus("録音中は再生できません");
+                return;
+              }
+              if (playing) {
+                audioRef.current?.pause();
+                setPlaying(false);
+                stopRaf();
+              }
+              const url = selectedReferenceAudio.path.startsWith("/")
+                ? selectedReferenceAudio.path
+                : `/${selectedReferenceAudio.path}`;
+              if (!referenceAudioRef.current) referenceAudioRef.current = new Audio();
+              const refAudio = referenceAudioRef.current;
+              refAudio.pause();
+              refAudio.src = url;
+              renderBase();
+              refAudio.onended = () => {
+                stopRefRaf();
+                setReferencePlaying(false);
+              };
+              refAudio.play()
+                .then(() => {
+                  setReferencePlaying(true);
+                  startRefRaf(refAudio);
+                })
+                .catch((e) => console.error(e));
+            }}
+            disabled={!selectedReferenceAudio || !referenceFeature || recording || referencePlaying}
+          >
+            お手本を再生
+          </button>
+          <button
+            onClick={() => {
+              if (recording) {
+                setStatus("録音中はお手本を変更できません");
+                return;
+              }
+              setReferenceOpen(true);
+            }}
+            disabled={recording}
+          >
+            お手本を選ぶ
+          </button>
+          <button
+            onClick={() => {
+              setSelectedReference(null);
+              setSelectedReferenceAudio(null);
+              setReferenceFeature(null);
+              setComparison(null);
+              setAlignmentError("");
+              setAlignedReference(null);
+              if (referenceAudioRef.current) {
+                referenceAudioRef.current.pause();
+                referenceAudioRef.current = null;
+              }
+              setReferencePlaying(false);
+              stopRefRaf();
+              renderBase();
+            }}
+            className="referenceClear"
+            aria-label="お手本をクリア"
+          >
+            ×
+          </button>
+        </div>
+      </div>
+
+      <DebugPanel
+        debugAllowed={debugAllowed}
+        debugOpen={debugOpen}
+        setDebugOpen={setDebugOpen}
+        params={params}
+        setParams={setParams}
+        busy={busy}
+        onReAnalyze={reAnalyze}
+        onResetDefaults={() => setParams(DEFAULT_PARAMS)}
+      />
+
+      {referenceError && <div className="small">{referenceError}</div>}
+      {referenceFeatureError && <div className="small">{referenceFeatureError}</div>}
+
+      {referenceIndex && referenceOpen && (
+        <div className="referenceOverlay" role="dialog" aria-modal="true">
+          <div className="referenceOverlayBody">
+            <div className="referenceOverlayHeader">
+              <div>お手本を選ぶ</div>
+              <button onClick={() => setReferenceOpen(false)}>閉じる</button>
+            </div>
+            <ReferenceList
+              items={referenceIndex.items}
+              voiceVariant={voiceVariant}
+              onToggleVoice={() => setVoiceVariant((v) => (v === "A" ? "B" : "A"))}
+              selectedAudioId={selectedReferenceAudio?.id ?? null}
+              onSelect={(item, audio) => {
+                setSelectedReference(item);
+                setSelectedReferenceAudio(audio);
+                renderBase();
+                setReferenceOpen(false);
+              }}
+            />
           </div>
-        )
+        </div>
       )}
     </div>
   );
 }
 
-function Field(props: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (v: number) => void;
-}) {
-  return (
-    <div className="field">
-      <label>
-        {props.label}
-        <div className="small">{String(props.value)}</div>
-      </label>
-      <input
-        type="number"
-        value={props.value}
-        min={props.min}
-        max={props.max}
-        step={props.step}
-        onChange={(e) => props.onChange(Number(e.target.value))}
-      />
-    </div>
-  );
+function pickReferenceAudio(item: ReferenceItem, variant: "A" | "B") {
+  if (!item.audio.length) return null;
+  const target = variant === "A" ? "F" : "M";
+  return item.audio.find((a) => a.gender === target) || item.audio[0];
 }
 
+function buildUserMfccFeatures(
+  pcm: Float32Array | null,
+  sr: number,
+  ref: ReferenceFeature
+) {
+  if (!pcm || pcm.length === 0) return null;
+  const frameSize = nextPow2(Math.max(64, Math.round((ref.windowMs / 1000) * sr)));
+  const hopSize = Math.max(1, Math.round((ref.hopMs / 1000) * sr));
+  const nMels = ref.mfcc?.nMels ?? 24;
+  const nMfcc = ref.mfcc?.nMfcc ?? 12;
+  const { features } = computeMfcc(pcm, {
+    sr,
+    frameSize,
+    hopSize,
+    nMels,
+    nMfcc,
+  });
+  return features;
+}
 
-function trimSilence(pcm: Float32Array, sr: number, rmsRatio: number, padMs: number) {
-  if (pcm.length === 0) return pcm;
+function nextPow2(n: number) {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
 
-  const win = Math.max(64, Math.round(sr * 0.02)); // 20ms
-  const hop = Math.max(32, Math.round(win / 2));
+function buildAlignedReference(user: F0Result, ref: ReferenceFeature, path: Array<[number, number]>): F0Result {
+  const map = new Map<number, number[]>();
+  for (const [ri, ui] of path) {
+    if (!map.has(ui)) map.set(ui, []);
+    map.get(ui)!.push(ri);
+  }
 
-  const rms: number[] = [];
-  let maxR = 0;
-  for (let start = 0; start + win <= pcm.length; start += hop) {
-    let s = 0;
-    for (let i = 0; i < win; i++) {
-      const v = pcm[start + i];
-      s += v * v;
+  const aligned = user.times.map((_, ui) => {
+    const targets = map.get(ui);
+    if (!targets || targets.length === 0) return NaN;
+    let sum = 0;
+    let count = 0;
+    for (const ri of targets) {
+      const v = ref.f0Log[ri];
+      if (!Number.isFinite(v)) continue;
+      sum += v;
+      count++;
     }
-    const r = Math.sqrt(s / win);
-    rms.push(r);
-    if (r > maxR) maxR = r;
-  }
-  if (maxR <= 1e-9) return pcm;
+    return count > 0 ? sum / count : NaN;
+  });
 
-  const thr = Math.max(1e-6, maxR * rmsRatio);
-
-  let first = -1, last = -1;
-  for (let i = 0; i < rms.length; i++) {
-    if (rms[i] >= thr) { first = i; break; }
-  }
-  for (let i = rms.length - 1; i >= 0; i--) {
-    if (rms[i] >= thr) { last = i; break; }
-  }
-  if (first < 0 || last < 0 || last < first) return pcm;
-
-  const pad = Math.round((padMs / 1000) * sr);
-
-  const startSample = Math.max(0, first * hop - pad);
-  const endSample = Math.min(pcm.length, (last * hop + win) + pad);
-
-  if (endSample - startSample < Math.round(0.2 * sr)) return pcm;
-  return pcm.slice(startSample, endSample);
-}
-
-
-function encodeWav16(samples: Float32Array, sampleRate: number) {
-  // mono, 16-bit PCM WAV
-  const numChannels = 1;
-  const bytesPerSample = 2;
-  const blockAlign = numChannels * bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = samples.length * bytesPerSample;
-
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  writeString(view, 0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(view, 8, "WAVE");
-  writeString(view, 12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
-  writeString(view, 36, "data");
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++) {
-    let s = Math.max(-1, Math.min(1, samples[i]));
-    const v = s < 0 ? s * 0x8000 : s * 0x7fff;
-    view.setInt16(offset, v, true);
-    offset += 2;
-  }
-
-  return new Blob([buffer], { type: "audio/wav" });
-}
-
-function writeString(view: DataView, offset: number, str: string) {
-  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  return {
+    sr: user.sr,
+    duration: user.duration,
+    times: user.times,
+    f0Log: aligned,
+  };
 }

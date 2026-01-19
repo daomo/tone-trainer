@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:reference": "node scripts/build-reference.mjs",
+    "build:features": "node scripts/build-features.mjs",
     "start": "next start",
     "lint": "next lint"
   },

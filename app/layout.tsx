@@ -1,8 +1,8 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "F0 Visualizer (YIN)",
-  description: "Local-only F0 visualizer using YIN + WebWorker",
+  title: "Tone Visualizer",
+  description: "Local-only F0 visualizer",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

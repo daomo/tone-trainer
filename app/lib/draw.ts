@@ -2,10 +2,11 @@ import type { F0Result, F0Params } from "./types";
 
 export type DrawState = {
   baseImage: ImageData | null;
+  duration: number;
 };
 
 export function makeDrawState(): DrawState {
-  return { baseImage: null };
+  return { baseImage: null, duration: 0 };
 }
 
 export function drawBase(
@@ -13,19 +14,46 @@ export function drawBase(
   cv: HTMLCanvasElement,
   result: F0Result,
   params: F0Params,
-  state: DrawState
+  state: DrawState,
+  reference?: { times: number[]; f0Log: number[]; duration: number }
 ) {
   const { width: W, height: H } = cv;
+  const duration = Math.max(result.duration, reference?.duration ?? 0);
 
   // background
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = "#0b0b0b";
   ctx.fillRect(0, 0, W, H);
 
-  drawAxes(ctx, cv, result, params);
-  drawF0Line(ctx, cv, result, params);
+  drawAxes(ctx, cv, params, duration);
+  if (reference) {
+    drawF0Line(ctx, cv, reference.times, reference.f0Log, params, duration, "#7bdc8d", 1.5, [4, 4]);
+  }
+  drawF0Line(ctx, cv, result.times, result.f0Log, params, duration, "#4dd0ff", 2);
 
   state.baseImage = ctx.getImageData(0, 0, W, H);
+  state.duration = duration;
+}
+
+export function drawReferenceOnly(
+  ctx: CanvasRenderingContext2D,
+  cv: HTMLCanvasElement,
+  params: F0Params,
+  state: DrawState,
+  reference: { times: number[]; f0Log: number[]; duration: number }
+) {
+  const { width: W, height: H } = cv;
+  const duration = Math.max(0.001, reference.duration);
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#0b0b0b";
+  ctx.fillRect(0, 0, W, H);
+
+  drawAxes(ctx, cv, params, duration);
+  drawF0Line(ctx, cv, reference.times, reference.f0Log, params, duration, "#7bdc8d", 1.5, [4, 4]);
+
+  state.baseImage = ctx.getImageData(0, 0, W, H);
+  state.duration = duration;
 }
 
 export function redrawWithCursor(
@@ -36,9 +64,25 @@ export function redrawWithCursor(
   state: DrawState,
   t: number
 ) {
+  if (!state.baseImage) {
+    drawBase(ctx, cv, result, params, state);
+  } else {
+    ctx.putImageData(state.baseImage, 0, 0);
+  }
+  const cursorDuration = state.duration > 0 ? state.duration : result.duration;
+  drawCursor(ctx, cv, t, cursorDuration);
+}
+
+export function redrawCursorOnly(
+  ctx: CanvasRenderingContext2D,
+  cv: HTMLCanvasElement,
+  state: DrawState,
+  t: number
+) {
   if (!state.baseImage) return;
   ctx.putImageData(state.baseImage, 0, 0);
-  drawCursor(ctx, cv, result, t);
+  const cursorDuration = state.duration > 0 ? state.duration : 0.001;
+  drawCursor(ctx, cv, t, cursorDuration);
 }
 
 function pad() {
@@ -48,8 +92,8 @@ function pad() {
 function drawAxes(
   ctx: CanvasRenderingContext2D,
   cv: HTMLCanvasElement,
-  result: F0Result,
-  params: F0Params
+  params: F0Params,
+  duration: number
 ) {
   const { width: W, height: H } = cv;
   const { L, R, T, B } = pad();
@@ -65,7 +109,7 @@ function drawAxes(
   ctx.fillText("log(Hz)", 6, 16);
 
   const x0 = L, x1 = W - R, y0 = T, y1 = H - B;
-  const dur = result.duration;
+  const dur = Math.max(0.001, duration);
 
   // x grid
   const nTick = 5;
@@ -102,26 +146,33 @@ function drawAxes(
 function drawF0Line(
   ctx: CanvasRenderingContext2D,
   cv: HTMLCanvasElement,
-  result: F0Result,
-  params: F0Params
+  times: number[],
+  f0Log: number[],
+  params: F0Params,
+  duration: number,
+  color: string,
+  lineWidth: number,
+  dash?: number[]
 ) {
   const { width: W, height: H } = cv;
   const { L, R, T, B } = pad();
   const x0 = L, x1 = W - R, y0 = T, y1 = H - B;
 
-  const dur = result.duration;
+  const dur = Math.max(0.001, duration);
   const yMin = Math.log(params.fminHz);
   const yMax = Math.log(params.fmaxHz);
 
-  ctx.strokeStyle = "#4dd0ff";
-  ctx.lineWidth = 2;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  if (dash && dash.length > 0) ctx.setLineDash(dash);
+  else ctx.setLineDash([]);
 
   let started = false;
   ctx.beginPath();
 
-  for (let i = 0; i < result.f0Log.length; i++) {
-    const t = result.times[i];
-    const v = result.f0Log[i];
+  for (let i = 0; i < f0Log.length; i++) {
+    const t = times[i];
+    const v = f0Log[i];
     if (!Number.isFinite(v)) { started = false; continue; }
 
     const x = x0 + (x1 - x0) * (t / dur);
@@ -132,19 +183,20 @@ function drawF0Line(
   }
 
   ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 function drawCursor(
   ctx: CanvasRenderingContext2D,
   cv: HTMLCanvasElement,
-  result: F0Result,
-  t: number
+  t: number,
+  duration: number
 ) {
   const { width: W, height: H } = cv;
   const { L, R, T, B } = pad();
   const x0 = L, x1 = W - R, y0 = T, y1 = H - B;
 
-  const dur = result.duration;
+  const dur = Math.max(0.001, duration);
   const clamped = Math.max(0, Math.min(dur, t));
   const x = x0 + (x1 - x0) * (clamped / dur);
 

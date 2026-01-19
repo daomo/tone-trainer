@@ -18,6 +18,12 @@ export type F0Params = {
   dpUSwitch: number;       // penalty for switching voiced <-> unvoiced
   dpUPenalty: number;      // per-frame penalty for choosing unvoiced (larger => prefer voiced)
 
+  // pYIN-style priors / biasing
+  voicedPrior: number;          // prior probability of voiced (0-1)
+  nearSilenceRatio: number;     // rmsSilence multiplier for near-silence
+  nearSilenceVoicedBias: number;   // add cost to voiced when near silence
+  nearSilenceUnvoicedBias: number; // subtract cost from unvoiced when near silence
+
   // Post-processing for stability (tone contour)
   maxJumpSemitone: number; // max allowed jump per frame (1-6)
   gapFillMs: number;       // fill short NaN gaps (50-250)
@@ -41,3 +47,58 @@ export type WorkerResponse =
   | { type: "progress"; phase: string }
   | { type: "result"; result: F0Result }
   | { type: "error"; message: string };
+
+export type ReferenceAudio = {
+  id: string;
+  gender: "F" | "M";
+  voice: string;
+  path: string;
+  featurePath?: string;
+};
+
+export type ReferenceItem = {
+  id: number;
+  key: string;
+  text: string;
+  pinyin: string;
+  ja: string;
+  grammarTag: string;
+  topicTag: string;
+  audio: ReferenceAudio[];
+};
+
+export type ReferenceIndex = {
+  version: number;
+  generatedAt: string;
+  count: number;
+  items: ReferenceItem[];
+};
+
+export type ReferenceFeature = {
+  id: number;
+  key: string;
+  audioId: string;
+  sr: number;
+  duration: number;
+  hopMs: number;
+  windowMs: number;
+  featureType: string;
+  featureDim: number;
+  features: number[][];
+  mfcc?: {
+    nMels: number;
+    nMfcc: number;
+    fMinHz: number;
+    fMaxHz: number;
+    preEmphasis: number;
+  };
+  times: number[];
+  f0Log: number[];
+};
+
+export type ComparisonResult = {
+  corr: number;
+  rmse: number;
+  slopeMatch: number;
+  peakShiftMs: number;
+};

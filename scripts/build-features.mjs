@@ -1,40 +1,78 @@
-/// <reference lib="webworker" />
+import fs from "node:fs/promises";
+import path from "node:path";
+import { spawn } from "node:child_process";
 
-import type { WorkerRequest, WorkerResponse, F0Params, F0Result } from "../lib/types";
+const ROOT = process.cwd();
+const INDEX_PATH = path.join(ROOT, "data", "reference", "index.json");
+const AUDIO_PUBLIC_DIR = path.join(ROOT, "public", "audio");
+const OUT_DIR = path.join(ROOT, "public", "reference", "features");
+const OUT_INDEX_PATH = path.join(ROOT, "public", "reference", "index.json");
+const OUT_DATA_INDEX_PATH = path.join(ROOT, "data", "reference", "index.json");
 
-(self as any).postMessage({ type: "ready" } satisfies WorkerResponse);
-
-(self as any).onmessage = (ev: MessageEvent<WorkerRequest>) => {
-  const msg = ev.data;
-  if (msg.type === "ping") {
-    (self as any).postMessage({ type: "ready" } satisfies WorkerResponse);
-    return;
-  }
-
-  if (msg.type === "analyze") {
-    try {
-      const { pcm, sr, params } = msg;
-
-      (self as any).postMessage({ type: "progress", phase: "YIN" } satisfies WorkerResponse);
-      const res = analyzeF0(pcm, sr, params);
-
-      (self as any).postMessage({ type: "result", result: res } satisfies WorkerResponse);
-    } catch (e: any) {
-      (self as any).postMessage({
-        type: "error",
-        message: e?.message ?? String(e),
-      } satisfies WorkerResponse);
-    }
-  }
+const SAMPLE_RATE = 16000;
+const DEFAULT_PARAMS = {
+  hopMs: 4,
+  windowMs: 100,
+  fminHz: 70,
+  fmaxHz: 500,
+  rmsSilence: 0.02,
+  yinThreshold: 0.12,
+  dpEnabled: true,
+  dpTopK: 5,
+  dpLambda: 80,
+  dpUSwitch: 0.5,
+  dpUPenalty: 0.6,
+  voicedPrior: 0.55,
+  nearSilenceRatio: 1.1,
+  nearSilenceVoicedBias: 0.2,
+  nearSilenceUnvoicedBias: 0.15,
+  gapFillMs: 30,
+  medWin: 3,
+  smoothWin: 7,
+};
+const MFCC_PARAMS = {
+  nMels: 24,
+  nMfcc: 12,
+  fMinHz: 20,
+  fMaxHz: SAMPLE_RATE / 2,
+  preEmphasis: 0.97,
 };
 
-function analyzeF0(pcm: Float32Array, sr: number, p: F0Params): F0Result {
+function decodeMp3ToF32(pathToFile) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-i", pathToFile,
+      "-f", "f32le",
+      "-ac", "1",
+      "-ar", String(SAMPLE_RATE),
+      "-",
+    ];
+    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const chunks = [];
+    let err = "";
+
+    proc.stdout.on("data", (d) => chunks.push(d));
+    proc.stderr.on("data", (d) => { err += d.toString(); });
+    proc.on("error", (e) => reject(e));
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg failed (${code}): ${err.trim()}`));
+        return;
+      }
+      const buffer = Buffer.concat(chunks);
+      const ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      resolve(new Float32Array(ab));
+    });
+  });
+}
+
+function analyzeF0(pcm, sr, p) {
   const hop = Math.max(1, Math.round(sr * (p.hopMs / 1000)));
   const frameSize = nextPow2(Math.round(sr * (p.windowMs / 1000)));
 
-  let f0LogRaw: number[];
+  let f0LogRaw;
   if (p.dpEnabled) {
-    const f0LogDp = yinCandidatesAndDp(pcm, sr, {
+    f0LogRaw = yinCandidatesAndDp(pcm, sr, {
       frameSize,
       hop,
       fminHz: p.fminHz,
@@ -50,7 +88,6 @@ function analyzeF0(pcm: Float32Array, sr: number, p: F0Params): F0Result {
       nearSilenceVoicedBias: Math.max(0, p.nearSilenceVoicedBias),
       nearSilenceUnvoicedBias: Math.max(0, p.nearSilenceUnvoicedBias),
     });
-    f0LogRaw = f0LogDp;
   } else {
     const f0 = yinTrack(pcm, sr, {
       frameSize,
@@ -60,53 +97,114 @@ function analyzeF0(pcm: Float32Array, sr: number, p: F0Params): F0Result {
       thresh: p.yinThreshold,
       rmsSilence: p.rmsSilence,
     });
-    f0LogRaw = f0.map(v => (Number.isFinite(v) && v > 0) ? Math.log(v) : NaN);
+    f0LogRaw = f0.map((v) => (Number.isFinite(v) && v > 0) ? Math.log(v) : NaN);
   }
 
-  (self as any).postMessage({ type: "progress", phase: "postprocess" } satisfies WorkerResponse);
-
-  // 1) median filter
   let f0Log = medianFilterNaN(f0LogRaw, p.medWin);
-
-  // 2) fill short gaps
   const gapMaxFrames = Math.max(0, Math.round((p.gapFillMs / 1000) * sr / hop));
   if (gapMaxFrames > 0) f0Log = fillShortGapsLinear(f0Log, gapMaxFrames);
-
-  // 3) moving average smooth
   f0Log = movingAverageNaN(f0Log, p.smoothWin);
 
-  const duration = pcm.length / sr;
-  const times = f0Log.map((_, i) => (i * hop) / sr);
-
-  return { sr, duration, times, f0Log };
+  return { f0Log, hop };
 }
 
-type Cand = {
-  logf0: number;     // NaN for unvoiced
-  obsCost: number;   // smaller is better
-  isU: boolean;
-};
+function computeMfcc(pcm, sr, params, mfccOpt) {
+  const hop = Math.max(1, Math.round(sr * (params.hopMs / 1000)));
+  const frameSize = nextPow2(Math.round(sr * (params.windowMs / 1000)));
+  const nFrames = Math.max(0, Math.floor((pcm.length - frameSize) / hop) + 1);
+  const window = buildHamming(frameSize);
+  const melBank = buildMelFilterBank(sr, frameSize, mfccOpt.nMels, mfccOpt.fMinHz, mfccOpt.fMaxHz);
+  const dct = buildDctTable(mfccOpt.nMfcc, mfccOpt.nMels);
 
-function yinCandidatesAndDp(
-  x: Float32Array,
-  sr: number,
-  opt: {
-    frameSize: number;
-    hop: number;
-    fminHz: number;
-    fmaxHz: number;
-    thresh: number;
-    rmsSilence: number;
-    topK: number;
-    lambda: number;
-    uSwitch: number;
-    uPenalty: number;
-    voicedPrior: number;
-    nearSilenceRatio: number;
-    nearSilenceVoicedBias: number;
-    nearSilenceUnvoicedBias: number;
+  const features = [];
+  const frame = new Float32Array(frameSize);
+  const real = new Float32Array(frameSize);
+  const imag = new Float32Array(frameSize);
+
+  for (let fi = 0; fi < nFrames; fi++) {
+    const start = fi * hop;
+    let prev = 0;
+    for (let i = 0; i < frameSize; i++) {
+      const x = pcm[start + i] || 0;
+      const y = x - mfccOpt.preEmphasis * prev;
+      prev = x;
+      frame[i] = y * window[i];
+      real[i] = frame[i];
+      imag[i] = 0;
+    }
+
+    fftInPlace(real, imag);
+    const power = powerSpectrum(real, imag);
+    const melE = applyMelBank(power, melBank);
+    const logE = melE.map((v) => Math.log(Math.max(1e-12, v)));
+    const mfcc = applyDct(logE, dct);
+    features.push(mfcc);
   }
-): number[] {
+
+  return features;
+}
+
+async function main() {
+  const raw = await fs.readFile(INDEX_PATH, "utf8");
+  const index = JSON.parse(raw);
+
+  await fs.mkdir(OUT_DIR, { recursive: true });
+
+  for (const item of index.items) {
+    for (const audio of item.audio) {
+      const filename = path.basename(audio.path);
+      const src = path.join(AUDIO_PUBLIC_DIR, filename);
+      const pcm = await decodeMp3ToF32(src);
+      const { f0Log, hop } = analyzeF0(pcm, SAMPLE_RATE, DEFAULT_PARAMS);
+      const times = f0Log.map((_, i) => (i * hop) / SAMPLE_RATE);
+      const mfcc = computeMfcc(pcm, SAMPLE_RATE, DEFAULT_PARAMS, MFCC_PARAMS);
+
+      const payload = {
+        id: item.id,
+        key: item.key,
+        audioId: audio.id,
+        sr: SAMPLE_RATE,
+        duration: pcm.length / SAMPLE_RATE,
+        hopMs: DEFAULT_PARAMS.hopMs,
+        windowMs: DEFAULT_PARAMS.windowMs,
+        featureType: "mfcc",
+        featureDim: MFCC_PARAMS.nMfcc,
+        features: mfcc,
+        mfcc: MFCC_PARAMS,
+        times,
+        f0Log,
+      };
+
+      const outName = `${audio.id}.json`;
+      audio.featurePath = `reference/features/${outName}`;
+      await fs.writeFile(path.join(OUT_DIR, outName), JSON.stringify(payload), "utf8");
+    }
+  }
+
+  index.generatedAt = new Date().toISOString();
+  await fs.writeFile(OUT_INDEX_PATH, JSON.stringify(index, null, 2), "utf8");
+  await fs.writeFile(OUT_DATA_INDEX_PATH, JSON.stringify(index, null, 2), "utf8");
+
+  console.log(`features: ${index.items.length} items`);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
+
+function nextPow2(n) {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+function clampInt(v, lo, hi) {
+  const n = Math.floor(Number.isFinite(v) ? v : lo);
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function yinCandidatesAndDp(x, sr, opt) {
   const {
     frameSize,
     hop,
@@ -126,17 +224,16 @@ function yinCandidatesAndDp(
 
   const tauMin = Math.max(2, Math.floor(sr / fmaxHz));
   const tauMax = Math.min(frameSize - 2, Math.floor(sr / fminHz));
-
   const nFrames = Math.max(0, Math.floor((x.length - frameSize) / hop) + 1);
-  const out = new Array<number>(nFrames).fill(NaN);
+  const out = new Array(nFrames).fill(NaN);
 
   const d = new Float32Array(tauMax + 1);
   const cmnd = new Float32Array(tauMax + 1);
 
-  // Build candidates per frame (K voiced + 1 unvoiced)
   const candLogf0 = new Float32Array(nFrames * (topK + 1));
   const candObs = new Float32Array(nFrames * (topK + 1));
   const candIsU = new Uint8Array(nFrames * (topK + 1));
+
   const unvoicedPrior = 1.0 - voicedPrior;
   const priorVoicedCost = -Math.log(Math.max(1e-6, voicedPrior));
   const priorUnvoicedCost = -Math.log(Math.max(1e-6, unvoicedPrior));
@@ -144,7 +241,6 @@ function yinCandidatesAndDp(
   for (let fi = 0; fi < nFrames; fi++) {
     const start = fi * hop;
 
-    // RMS
     let rms = 0;
     for (let i = 0; i < frameSize; i++) {
       const v = x[start + i] || 0;
@@ -152,7 +248,6 @@ function yinCandidatesAndDp(
     }
     rms = Math.sqrt(rms / frameSize);
 
-    // Difference function
     d[0] = 0;
     for (let tau = 1; tau <= tauMax; tau++) {
       let sum = 0;
@@ -164,7 +259,6 @@ function yinCandidatesAndDp(
       d[tau] = sum;
     }
 
-    // CMND
     cmnd[0] = 1;
     let runningSum = 0;
     for (let tau = 1; tau <= tauMax; tau++) {
@@ -172,13 +266,10 @@ function yinCandidatesAndDp(
       cmnd[tau] = (d[tau] * tau) / (runningSum + 1e-12);
     }
 
-    // Collect local minima in [tauMin, tauMax]
-    // Threshold-independent selection: pick smallest CMND local minima.
-    const mins: { tau: number; v: number }[] = [];
+    const mins = [];
     for (let tau = tauMin + 1; tau <= tauMax - 1; tau++) {
       const v = cmnd[tau];
       if (v <= cmnd[tau - 1] && v < cmnd[tau + 1]) {
-        // Do NOT gate by threshold here; DP will choose the best path globally.
         mins.push({ tau, v });
       }
     }
@@ -186,7 +277,6 @@ function yinCandidatesAndDp(
 
     const isNearSilence = rms < rmsSilence * nearSilenceRatio;
 
-    // Fill voiced candidates
     for (let k = 0; k < topK; k++) {
       const idx = fi * (topK + 1) + k;
       if (k >= mins.length) {
@@ -205,28 +295,22 @@ function yinCandidatesAndDp(
         continue;
       }
       candLogf0[idx] = Math.log(f0);
-      candObs[idx] = mins[k].v + (isNearSilence ? nearSilenceVoicedBias : 0.0); // smaller better
+      candObs[idx] = mins[k].v + (isNearSilence ? nearSilenceVoicedBias : 0.0);
       candIsU[idx] = 0;
     }
 
-    // Unvoiced candidate at slot topK
     {
       const idx = fi * (topK + 1) + topK;
       candLogf0[idx] = NaN;
       candIsU[idx] = 1;
-      // Make unvoiced expensive when energy exists.
-      // - if rms is very small, unvoiced is cheap
-      // - otherwise, cost rises quickly with rms/rmsSilence, plus a base uPenalty
       if (rms < rmsSilence) {
         candObs[idx] = 0.0;
       } else {
         const ratio = Math.min(8.0, rms / (rmsSilence + 1e-12));
-        // ratio>=1 => already above silence; push unvoiced cost up strongly
         candObs[idx] = uPenalty + 0.6 * ratio;
       }
     }
 
-    // Normalize voiced candidate costs within frame to stabilize scaling.
     let minObs = Infinity;
     let maxObs = -Infinity;
     for (let k = 0; k < topK; k++) {
@@ -245,7 +329,6 @@ function yinCandidatesAndDp(
     candObs[uIdx] = candObs[uIdx] + priorUnvoicedCost - (isNearSilence ? nearSilenceUnvoicedBias : 0.0);
   }
 
-  // DP / Viterbi over fixed-size state per frame (topK+1)
   const S = topK + 1;
   const dp = new Float32Array(nFrames * S);
   const bp = new Int16Array(nFrames * S);
@@ -285,7 +368,6 @@ function yinCandidatesAndDp(
     }
   }
 
-  // Backtrack
   let bestFinal = 1e12;
   let bestState = 0;
   const lastBase = (nFrames - 1) * S;
@@ -310,30 +392,14 @@ function yinCandidatesAndDp(
   return out;
 }
 
-function clampInt(v: number, lo: number, hi: number) {
-  const n = Math.floor(Number.isFinite(v) ? v : lo);
-  return Math.max(lo, Math.min(hi, n));
-}
-
-function yinTrack(
-  x: Float32Array,
-  sr: number,
-  opt: {
-    frameSize: number;
-    hop: number;
-    fminHz: number;
-    fmaxHz: number;
-    thresh: number;
-    rmsSilence: number;
-  }
-) {
+function yinTrack(x, sr, opt) {
   const { frameSize, hop, fminHz, fmaxHz, thresh, rmsSilence } = opt;
 
   const tauMin = Math.max(2, Math.floor(sr / fmaxHz));
   const tauMax = Math.min(frameSize - 2, Math.floor(sr / fminHz));
 
   const nFrames = Math.max(0, Math.floor((x.length - frameSize) / hop) + 1);
-  const out = new Array<number>(nFrames).fill(NaN);
+  const out = new Array(nFrames).fill(NaN);
 
   const d = new Float32Array(tauMax + 1);
   const cmnd = new Float32Array(tauMax + 1);
@@ -341,7 +407,6 @@ function yinTrack(
   for (let fi = 0; fi < nFrames; fi++) {
     const start = fi * hop;
 
-    // RMS silence gate
     let rms = 0;
     for (let i = 0; i < frameSize; i++) {
       const v = x[start + i] || 0;
@@ -353,7 +418,6 @@ function yinTrack(
       continue;
     }
 
-    // Difference function
     d[0] = 0;
     for (let tau = 1; tau <= tauMax; tau++) {
       let sum = 0;
@@ -365,7 +429,6 @@ function yinTrack(
       d[tau] = sum;
     }
 
-    // CMND
     cmnd[0] = 1;
     let runningSum = 0;
     for (let tau = 1; tau <= tauMax; tau++) {
@@ -373,7 +436,6 @@ function yinTrack(
       cmnd[tau] = (d[tau] * tau) / (runningSum + 1e-12);
     }
 
-    // First dip below threshold
     let tauEstimate = -1;
     for (let tau = tauMin; tau <= tauMax; tau++) {
       if (cmnd[tau] < thresh) {
@@ -389,14 +451,13 @@ function yinTrack(
 
     const betterTau = parabolicInterp(cmnd, tauEstimate, 1, tauMax);
     const f0 = sr / betterTau;
-
     out[fi] = (f0 >= fminHz && f0 <= fmaxHz) ? f0 : NaN;
   }
 
   return out;
 }
 
-function parabolicInterp(arr: Float32Array, x0: number, xmin: number, xmax: number) {
+function parabolicInterp(arr, x0, xmin, xmax) {
   const x1 = Math.max(xmin, x0 - 1);
   const x2 = x0;
   const x3 = Math.min(xmax, x0 + 1);
@@ -411,20 +472,14 @@ function parabolicInterp(arr: Float32Array, x0: number, xmin: number, xmax: numb
   return x0 + delta;
 }
 
-function nextPow2(n: number) {
-  let p = 1;
-  while (p < n) p <<= 1;
-  return p;
-}
-
-function medianFilterNaN(x: number[], win: number) {
+function medianFilterNaN(x, win) {
   if (win <= 1) return x.slice();
   if (win % 2 === 0) win += 1;
   const r = Math.floor(win / 2);
-  const out = new Array<number>(x.length);
+  const out = new Array(x.length);
 
   for (let i = 0; i < x.length; i++) {
-    const buf: number[] = [];
+    const buf = [];
     for (let k = -r; k <= r; k++) {
       const j = i + k;
       if (j < 0 || j >= x.length) continue;
@@ -440,7 +495,7 @@ function medianFilterNaN(x: number[], win: number) {
   return out;
 }
 
-function fillShortGapsLinear(x: number[], maxGap: number) {
+function fillShortGapsLinear(x, maxGap) {
   const out = x.slice();
   const n = out.length;
   let i = 0;
@@ -464,11 +519,11 @@ function fillShortGapsLinear(x: number[], maxGap: number) {
   return out;
 }
 
-function movingAverageNaN(x: number[], win: number) {
+function movingAverageNaN(x, win) {
   if (win <= 1) return x.slice();
   if (win % 2 === 0) win += 1;
   const r = Math.floor(win / 2);
-  const out = new Array<number>(x.length);
+  const out = new Array(x.length);
 
   for (let i = 0; i < x.length; i++) {
     let sum = 0;
@@ -480,6 +535,131 @@ function movingAverageNaN(x: number[], win: number) {
       if (Number.isFinite(v)) { sum += v; cnt++; }
     }
     out[i] = cnt > 0 ? sum / cnt : NaN;
+  }
+  return out;
+}
+
+function buildHamming(n) {
+  const w = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    w[i] = 0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (n - 1));
+  }
+  return w;
+}
+
+function hzToMel(hz) {
+  return 2595 * Math.log10(1 + hz / 700);
+}
+
+function melToHz(mel) {
+  return 700 * (Math.pow(10, mel / 2595) - 1);
+}
+
+function buildMelFilterBank(sr, nFft, nMels, fMinHz, fMaxHz) {
+  const melMin = hzToMel(fMinHz);
+  const melMax = hzToMel(fMaxHz);
+  const melPoints = new Array(nMels + 2)
+    .fill(0)
+    .map((_, i) => melMin + ((melMax - melMin) * i) / (nMels + 1));
+  const hzPoints = melPoints.map(melToHz);
+  const binPoints = hzPoints.map((hz) => Math.floor(((nFft + 1) * hz) / sr));
+
+  const filters = [];
+  const nBins = Math.floor(nFft / 2) + 1;
+  for (let m = 1; m <= nMels; m++) {
+    const f = new Float32Array(nBins);
+    const left = binPoints[m - 1];
+    const center = binPoints[m];
+    const right = binPoints[m + 1];
+    for (let k = left; k < center; k++) {
+      if (k >= 0 && k < nBins) f[k] = (k - left) / Math.max(1, center - left);
+    }
+    for (let k = center; k < right; k++) {
+      if (k >= 0 && k < nBins) f[k] = (right - k) / Math.max(1, right - center);
+    }
+    filters.push(f);
+  }
+  return filters;
+}
+
+function buildDctTable(nMfcc, nMels) {
+  const table = [];
+  for (let k = 0; k < nMfcc; k++) {
+    const row = [];
+    for (let n = 0; n < nMels; n++) {
+      row.push(Math.cos((Math.PI * k * (n + 0.5)) / nMels));
+    }
+    table.push(row);
+  }
+  return table;
+}
+
+function fftInPlace(real, imag) {
+  const n = real.length;
+  let j = 0;
+  for (let i = 1; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [real[i], real[j]] = [real[j], real[i]];
+      [imag[i], imag[j]] = [imag[j], imag[i]];
+    }
+  }
+
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wlenCos = Math.cos(ang);
+    const wlenSin = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let wCos = 1;
+      let wSin = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const uRe = real[i + j];
+        const uIm = imag[i + j];
+        const vRe = real[i + j + len / 2] * wCos - imag[i + j + len / 2] * wSin;
+        const vIm = real[i + j + len / 2] * wSin + imag[i + j + len / 2] * wCos;
+
+        real[i + j] = uRe + vRe;
+        imag[i + j] = uIm + vIm;
+        real[i + j + len / 2] = uRe - vRe;
+        imag[i + j + len / 2] = uIm - vIm;
+
+        const nextCos = wCos * wlenCos - wSin * wlenSin;
+        const nextSin = wCos * wlenSin + wSin * wlenCos;
+        wCos = nextCos;
+        wSin = nextSin;
+      }
+    }
+  }
+}
+
+function powerSpectrum(real, imag) {
+  const nBins = Math.floor(real.length / 2) + 1;
+  const out = new Float32Array(nBins);
+  for (let i = 0; i < nBins; i++) {
+    out[i] = real[i] * real[i] + imag[i] * imag[i];
+  }
+  return out;
+}
+
+function applyMelBank(power, bank) {
+  return bank.map((f) => {
+    let sum = 0;
+    for (let i = 0; i < power.length; i++) {
+      sum += power[i] * f[i];
+    }
+    return sum;
+  });
+}
+
+function applyDct(logE, dct) {
+  const out = [];
+  for (let k = 0; k < dct.length; k++) {
+    let sum = 0;
+    const row = dct[k];
+    for (let n = 0; n < logE.length; n++) sum += logE[n] * row[n];
+    out.push(sum);
   }
   return out;
 }
