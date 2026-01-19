@@ -25,6 +25,8 @@ import { dtwBandFeatures } from "./features/analysis/dtw";
 import { computeMfcc } from "./features/analysis/mfcc";
 
 export default function Page() {
+  const repo = process.env.NEXT_PUBLIC_REPO_NAME ?? "";
+  const basePath = repo ? `/${repo}` : "";
   const [params, setParams] = useState<F0Params>(DEFAULT_PARAMS);
   const [status, setStatus] = useState<string>("ready");
   const [busy, setBusy] = useState(false);
@@ -155,7 +157,7 @@ export default function Page() {
 
   useEffect(() => {
     let alive = true;
-    fetch("/reference/index.json")
+    fetch(`${basePath}/reference/index.json`)
       .then((res) => {
         if (!res.ok) throw new Error(`index fetch failed (${res.status})`);
         return res.json();
@@ -185,9 +187,10 @@ export default function Page() {
       return;
     }
     let alive = true;
-    const url = selectedReferenceAudio.featurePath.startsWith("/")
+    const rawPath = selectedReferenceAudio.featurePath.startsWith("/")
       ? selectedReferenceAudio.featurePath
       : `/${selectedReferenceAudio.featurePath}`;
+    const url = `${basePath}${rawPath}`;
     fetch(url)
       .then((res) => {
         if (!res.ok) throw new Error(`feature fetch failed (${res.status})`);
@@ -575,9 +578,10 @@ export default function Page() {
                 setPlaying(false);
                 stopRaf();
               }
-              const url = selectedReferenceAudio.path.startsWith("/")
+              const rawPath = selectedReferenceAudio.path.startsWith("/")
                 ? selectedReferenceAudio.path
                 : `/${selectedReferenceAudio.path}`;
+              const url = `${basePath}${rawPath}`;
               if (!referenceAudioRef.current) referenceAudioRef.current = new Audio();
               const refAudio = referenceAudioRef.current;
               refAudio.pause();
@@ -657,6 +661,7 @@ export default function Page() {
             </div>
             <ReferenceList
               items={referenceIndex.items}
+              basePath={basePath}
               voiceVariant={voiceVariant}
               onToggleVoice={() => setVoiceVariant((v) => (v === "A" ? "B" : "A"))}
               selectedAudioId={selectedReferenceAudio?.id ?? null}

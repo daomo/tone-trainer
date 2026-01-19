@@ -3,6 +3,7 @@ import type { ReferenceItem, ReferenceAudio } from "../lib/types";
 
 type ReferenceListProps = {
   items: ReferenceItem[];
+  basePath: string;
   voiceVariant: "A" | "B";
   onToggleVoice: () => void;
   selectedAudioId: string | null;
@@ -10,7 +11,7 @@ type ReferenceListProps = {
 };
 
 export default function ReferenceList(props: ReferenceListProps) {
-  const { items, voiceVariant, onToggleVoice, selectedAudioId, onSelect } = props;
+  const { items, basePath, voiceVariant, onToggleVoice, selectedAudioId, onSelect } = props;
   const [playingId, setPlayingId] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -28,7 +29,8 @@ export default function ReferenceList(props: ReferenceListProps) {
   async function handlePlay(item: ReferenceItem) {
     const audio = pickAudio(item.audio);
     if (!audio) return;
-    const url = audio.path.startsWith("/") ? audio.path : `/${audio.path}`;
+    const rawPath = audio.path.startsWith("/") ? audio.path : `/${audio.path}`;
+    const url = `${basePath}${rawPath}`;
 
     if (!audioRef.current) audioRef.current = new Audio();
     const player = audioRef.current;
