@@ -215,11 +215,6 @@ export default function Page() {
   }, [referenceFeature, renderBase]);
 
   useEffect(() => {
-    if (!selectedReference) return;
-    clearRecording();
-  }, [selectedReference, clearRecording]);
-
-  useEffect(() => {
     const user = analysisRef.current;
     if (!user) {
       setComparison(null);
@@ -666,6 +661,7 @@ export default function Page() {
               onToggleVoice={() => setVoiceVariant((v) => (v === "A" ? "B" : "A"))}
               selectedAudioId={selectedReferenceAudio?.id ?? null}
               onSelect={(item, audio) => {
+                clearRecording();
                 setSelectedReference(item);
                 setSelectedReferenceAudio(audio);
                 renderBase();
