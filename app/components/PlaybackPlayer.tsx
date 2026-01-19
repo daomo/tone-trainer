@@ -1,7 +1,7 @@
 import type { RefObject } from "react";
 
 type PlaybackPlayerProps = {
-  audioRef: RefObject<HTMLAudioElement>;
+  audioRef: RefObject<HTMLAudioElement | null>;
   blobUrl: string;
   onPlay: () => void;
   onPause: () => void;

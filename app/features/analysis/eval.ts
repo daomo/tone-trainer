@@ -110,8 +110,12 @@ function peakShift(
 
   const mapping = new Map<number, number[]>();
   for (const [ri, ui] of path) {
-    if (!mapping.has(ri)) mapping.set(ri, []);
-    mapping.get(ri).push(ui);
+    const existing = mapping.get(ri);
+    if (existing) {
+      existing.push(ui);
+    } else {
+      mapping.set(ri, [ui]);
+    }
   }
   const targets = mapping.get(refPeakIdx);
   if (!targets || targets.length === 0) return 0;

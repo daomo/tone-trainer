@@ -1,7 +1,7 @@
 import type { RefObject } from "react";
 
 type PitchCanvasProps = {
-  canvasRef: RefObject<HTMLCanvasElement>;
+  canvasRef: RefObject<HTMLCanvasElement | null>;
   busy: boolean;
 };
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   F0Params,
   F0Result,
@@ -66,6 +66,54 @@ export default function Page() {
   const [alignedReference, setAlignedReference] = useState<F0Result | null>(null);
   const referenceAudioRef = useRef<HTMLAudioElement | null>(null);
   const refRafRef = useRef<number | null>(null);
+
+  const stopRaf = useCallback(() => {
+    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+  }, []);
+
+  const renderBase = useCallback((opts?: {
+    user?: F0Result | null;
+    reference?: ReferenceFeature | null;
+    alignedReference?: F0Result | null;
+  }) => {
+    const ctx = ctxRef.current;
+    const cv = cvRef.current;
+    if (!ctx || !cv) return;
+    const user = opts?.user ?? analysisRef.current;
+    const reference = opts?.reference ?? referenceFeature;
+    const aligned = opts?.alignedReference ?? alignedReference;
+
+    if (user) {
+      const ref = aligned
+        ? { times: aligned.times, f0Log: aligned.f0Log, duration: aligned.duration }
+        : undefined;
+      drawBase(ctx, cv, user, params, drawState, ref);
+      return;
+    }
+
+    if (reference) {
+      drawReferenceOnly(ctx, cv, params, drawState, {
+        times: reference.times,
+        f0Log: reference.f0Log,
+        duration: reference.duration,
+      });
+    }
+  }, [alignedReference, drawState, params, referenceFeature]);
+
+  const clearRecording = useCallback(() => {
+    analysisRef.current = null;
+    setAlignedReference(null);
+    setAlignmentError("");
+    setComparison(null);
+    setBlobUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return "";
+    });
+    stopRaf();
+    setPlaying(false);
+    renderBase({ user: null, reference: referenceFeature ?? null });
+  }, [referenceFeature, renderBase, stopRaf]);
 
   useEffect(() => {
     const cv = cvRef.current!;
@@ -161,12 +209,12 @@ export default function Page() {
 
   useEffect(() => {
     renderBase();
-  }, [referenceFeature]);
+  }, [referenceFeature, renderBase]);
 
   useEffect(() => {
     if (!selectedReference) return;
     clearRecording();
-  }, [selectedReference]);
+  }, [selectedReference, clearRecording]);
 
   useEffect(() => {
     const user = analysisRef.current;
@@ -214,7 +262,7 @@ export default function Page() {
       reference: referenceFeature,
       alignedReference: aligned,
     });
-  }, [referenceFeature, analysisVersion]);
+  }, [referenceFeature, analysisVersion, renderBase]);
 
   useEffect(() => {
     if (!isProd) return;
@@ -266,54 +314,6 @@ export default function Page() {
       refRafRef.current = requestAnimationFrame(tick);
     };
     refRafRef.current = requestAnimationFrame(tick);
-  }
-
-  function clearRecording() {
-    analysisRef.current = null;
-    setAlignedReference(null);
-    setAlignmentError("");
-    setComparison(null);
-    setBlobUrl((prev) => {
-      if (prev) URL.revokeObjectURL(prev);
-      return "";
-    });
-    stopRaf();
-    setPlaying(false);
-    renderBase({ user: null, reference: referenceFeature ?? null });
-  }
-
-  function renderBase(opts?: {
-    user?: F0Result | null;
-    reference?: ReferenceFeature | null;
-    alignedReference?: F0Result | null;
-  }) {
-    const ctx = ctxRef.current;
-    const cv = cvRef.current;
-    if (!ctx || !cv) return;
-    const user = opts?.user ?? analysisRef.current;
-    const reference = opts?.reference ?? referenceFeature;
-    const aligned = opts?.alignedReference ?? alignedReference;
-
-    if (user) {
-      const ref = aligned
-        ? { times: aligned.times, f0Log: aligned.f0Log, duration: aligned.duration }
-        : undefined;
-      drawBase(ctx, cv, user, params, drawState, ref);
-      return;
-    }
-
-    if (reference) {
-      drawReferenceOnly(ctx, cv, params, drawState, {
-        times: reference.times,
-        f0Log: reference.f0Log,
-        duration: reference.duration,
-      });
-    }
-  }
-
-  function stopRaf() {
-    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
   }
 
   function startRaf() {
